@@ -758,7 +758,13 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
 
   // Group-specific: resolve config, track members, format member list
   const groupConfig = !isDirect ? resolveGroupConfig(dingtalkConfig, groupId) : undefined;
-  const groupSystemPrompt = groupConfig?.systemPrompt?.trim() || undefined;
+  // GroupSystemPrompt is injected into the system prompt on every turn (unlike
+  // group intro which only fires on the first turn). Embed DingTalk IDs here so
+  // the AI always has access to conversationId.
+  const groupSystemPrompt = !isDirect ? [
+    `DingTalk group context: conversationId=${groupId}`,
+    groupConfig?.systemPrompt?.trim(),
+  ].filter(Boolean).join('\n') : undefined;
 
   if (!isDirect) {
     noteGroupMember(storePath, groupId, senderId, senderName);
@@ -778,13 +784,8 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
   });
 
   const to = isDirect ? senderId : groupId;
-  // Append conversationId hint to group messages so the AI can always see it
-  // (group intro is only injected on the first turn of a session).
-  const bodyWithGroupHint = !isDirect && groupId
-    ? `${body}\n[conversationId: ${groupId}]`
-    : body;
   const ctx = rt.channel.reply.finalizeInboundContext({
-    Body: bodyWithGroupHint,
+    Body: body,
     RawBody: content.text,
     CommandBody: content.text,
     From: to,
