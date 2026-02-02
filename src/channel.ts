@@ -778,8 +778,13 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
   });
 
   const to = isDirect ? senderId : groupId;
+  // Append conversationId hint to group messages so the AI can always see it
+  // (group intro is only injected on the first turn of a session).
+  const bodyWithGroupHint = !isDirect && groupId
+    ? `${body}\n[conversationId: ${groupId}]`
+    : body;
   const ctx = rt.channel.reply.finalizeInboundContext({
-    Body: body,
+    Body: bodyWithGroupHint,
     RawBody: content.text,
     CommandBody: content.text,
     From: to,
