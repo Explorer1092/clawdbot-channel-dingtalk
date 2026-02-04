@@ -615,27 +615,42 @@ async function processMediaInText(
   log?: Logger
 ): Promise<string> {
   if (!config.enableMediaUpload) {
+    log?.debug?.('[DingTalk][Media] enableMediaUpload=false, skipping');
     return text;
   }
 
   const matches = [...text.matchAll(MARKDOWN_IMAGE_REGEX)];
   if (matches.length === 0) {
+    log?.debug?.('[DingTalk][Media] No markdown images found in text');
     return text;
   }
+
+  log?.info?.(`[DingTalk][Media] Found ${matches.length} markdown image(s) in text`);
 
   // Collect unique local paths and their replacements
   const replacements = new Map<string, string>(); // fullMatch -> replacement
 
   for (const [fullMatch, alt, imagePath] of matches) {
-    if (!isLocalFilePath(imagePath)) continue;
+    log?.debug?.(`[DingTalk][Media] Checking image: path="${imagePath}", exists=${fs.existsSync(imagePath)}, startsWithSlash=${imagePath.startsWith('/')}`);
+
+    if (!isLocalFilePath(imagePath)) {
+      log?.debug?.(`[DingTalk][Media] Skipping non-local path: ${imagePath}`);
+      continue;
+    }
     if (replacements.has(fullMatch)) continue; // Already processed this exact match
 
     // Check cache first to avoid duplicate uploads during streaming
     let mediaId = getCachedMediaId(config.clientId, imagePath);
-    if (!mediaId) {
+    if (mediaId) {
+      log?.debug?.(`[DingTalk][Media] Using cached media_id for ${imagePath}`);
+    } else {
+      log?.info?.(`[DingTalk][Media] Uploading image: ${imagePath}`);
       mediaId = await uploadImageToDingTalk(config, imagePath, log);
       if (mediaId) {
         cacheMediaId(config.clientId, imagePath, mediaId);
+        log?.info?.(`[DingTalk][Media] Upload success: ${imagePath} -> ${mediaId}`);
+      } else {
+        log?.warn?.(`[DingTalk][Media] Upload failed for: ${imagePath}`);
       }
     }
 
@@ -648,6 +663,10 @@ async function processMediaInText(
   let result = text;
   for (const [fullMatch, replacement] of replacements) {
     result = result.split(fullMatch).join(replacement);
+  }
+
+  if (replacements.size > 0) {
+    log?.info?.(`[DingTalk][Media] Replaced ${replacements.size} image(s) with media_id`);
   }
 
   return result;
