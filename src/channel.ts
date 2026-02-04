@@ -45,8 +45,122 @@ const activeCardsByTarget = new Map<string, string>();
 // Card cache TTL (1 hour)
 const CARD_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
-// DingTalk API base URL
+// DingTalk API base URLs
 const DINGTALK_API = 'https://api.dingtalk.com';
+const DINGTALK_OAPI = 'https://oapi.dingtalk.com';
+
+// ============ Message Deduplication ============
+
+const processedMessages = new Map<string, number>();
+const MESSAGE_DEDUP_TTL = 5 * 60 * 1000; // 5 minutes
+const MESSAGE_DEDUP_CLEANUP_THRESHOLD = 100;
+
+function cleanupProcessedMessages(): void {
+  const now = Date.now();
+  for (const [msgId, timestamp] of processedMessages.entries()) {
+    if (now - timestamp > MESSAGE_DEDUP_TTL) {
+      processedMessages.delete(msgId);
+    }
+  }
+}
+
+function isMessageProcessed(messageId: string): boolean {
+  return processedMessages.has(messageId);
+}
+
+function markMessageProcessed(messageId: string): void {
+  processedMessages.set(messageId, Date.now());
+  if (processedMessages.size >= MESSAGE_DEDUP_CLEANUP_THRESHOLD) {
+    cleanupProcessedMessages();
+  }
+}
+
+// ============ Media Upload System Prompt ============
+
+const MEDIA_UPLOAD_SYSTEM_PROMPT = `## 钉钉媒体输出规则
+
+输出图片时，直接使用本地文件路径，系统会自动上传：
+
+**正确方式**：
+- ![描述](/path/to/image.png)
+- ![描述](/tmp/screenshot.jpg)
+
+**禁止**：
+- 不要猜测或构造 URL
+- 不要对路径添加转义字符
+
+直接输出本地路径即可。`;
+
+// ============ OAPI Access Token (for media upload) ============
+
+const oapiTokenCache = new Map<string, { token: string; expiry: number }>();
+const TOKEN_SAFETY_MARGIN = 60 * 1000; // 1 minute safety margin before expiry
+
+// ============ Media Upload Cache ============
+// Prevents re-uploading the same file during streaming
+const mediaUploadCache = new Map<string, string>();
+const MEDIA_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const mediaUploadCacheTimestamps = new Map<string, number>();
+
+function getCachedMediaId(clientId: string, filePath: string): string | null {
+  const cacheKey = `${clientId}:${filePath}`;
+  const cached = mediaUploadCache.get(cacheKey);
+  const timestamp = mediaUploadCacheTimestamps.get(cacheKey);
+  if (cached && timestamp && Date.now() - timestamp < MEDIA_CACHE_TTL) {
+    return cached;
+  }
+  return null;
+}
+
+function cacheMediaId(clientId: string, filePath: string, mediaId: string): void {
+  const cacheKey = `${clientId}:${filePath}`;
+  mediaUploadCache.set(cacheKey, mediaId);
+  mediaUploadCacheTimestamps.set(cacheKey, Date.now());
+
+  // Cleanup old entries if cache grows too large
+  if (mediaUploadCache.size > 100) {
+    const now = Date.now();
+    for (const [key, ts] of mediaUploadCacheTimestamps.entries()) {
+      if (now - ts > MEDIA_CACHE_TTL) {
+        mediaUploadCache.delete(key);
+        mediaUploadCacheTimestamps.delete(key);
+      }
+    }
+  }
+}
+
+async function getOapiAccessToken(config: DingTalkConfig, log?: Logger): Promise<string> {
+  const now = Date.now();
+  const cacheKey = `oapi:${config.clientId}`;
+  const cached = oapiTokenCache.get(cacheKey);
+
+  if (cached && cached.expiry > now + TOKEN_SAFETY_MARGIN) {
+    return cached.token;
+  }
+
+  const response = await axios.get(`${DINGTALK_OAPI}/gettoken`, {
+    params: { appkey: config.clientId, appsecret: config.clientSecret }
+  });
+
+  // Check for API error
+  if (response.data.errcode && response.data.errcode !== 0) {
+    const errorMsg = `OAPI token error: ${response.data.errcode} - ${response.data.errmsg || 'Unknown error'}`;
+    log?.error?.(`[DingTalk] ${errorMsg}`);
+    throw new Error(errorMsg);
+  }
+
+  const token = response.data.access_token;
+  if (!token) {
+    const errorMsg = 'OAPI returned empty access_token';
+    log?.error?.(`[DingTalk] ${errorMsg}`);
+    throw new Error(errorMsg);
+  }
+
+  const expiry = now + (response.data.expires_in || 7200) * 1000;
+  oapiTokenCache.set(cacheKey, { token, expiry });
+  log?.debug?.('[DingTalk] OAPI access token refreshed');
+  return token;
+}
 
 // Build common DingTalk API headers
 function dingtalkHeaders(token: string): Record<string, string> {
@@ -185,6 +299,18 @@ function resolveGroupConfig(cfg: DingTalkConfig, groupId: string): { systemPromp
   return groups[groupId] || groups['*'] || undefined;
 }
 
+// ============ Target Prefix Helpers ============
+
+function stripTargetPrefix(target: string): { targetId: string; isExplicitUser: boolean } {
+  if (target.startsWith('group:')) {
+    return { targetId: target.slice(6), isExplicitUser: false };
+  }
+  if (target.startsWith('user:')) {
+    return { targetId: target.slice(5), isExplicitUser: true };
+  }
+  return { targetId: target, isExplicitUser: false };
+}
+
 // ============ Config Helpers ============
 
 function getConfig(cfg: OpenClawConfig, accountId?: string): DingTalkConfig {
@@ -239,10 +365,12 @@ async function sendProactiveTextOrMarkdown(
   options: SendMessageOptions = {}
 ): Promise<AxiosResponse> {
   const token = await getAccessToken(config, options.log);
-  // Strip 'group:' prefix added by routing layer before calling DingTalk API
-  const resolvedTarget = resolveOriginalPeerId(target.replace(/^group:/, ''));
-  const isGroup = resolvedTarget.startsWith('cid');
   const log = options.log || getLogger();
+
+  // Support group: and user: prefixes
+  const { targetId, isExplicitUser } = stripTargetPrefix(target);
+  const resolvedTarget = resolveOriginalPeerId(targetId);
+  const isGroup = !isExplicitUser && resolvedTarget.startsWith('cid');
 
   const url = isGroup
     ? 'https://api.dingtalk.com/v1.0/robot/groupMessages/send'
@@ -313,6 +441,94 @@ async function downloadMedia(config: DingTalkConfig, downloadCode: string, log?:
     }
     return null;
   }
+}
+
+// ============ Image Upload to DingTalk ============
+
+const MARKDOWN_IMAGE_REGEX = /!\[([^\]]*)\]\(([^)]+)\)/g;
+
+async function uploadImageToDingTalk(
+  config: DingTalkConfig,
+  imagePath: string,
+  log?: Logger
+): Promise<string | null> {
+  if (!fs.existsSync(imagePath)) {
+    log?.debug?.(`[DingTalk] Image not found: ${imagePath}`);
+    return null;
+  }
+
+  try {
+    const token = await getOapiAccessToken(config, log);
+    const FormData = (await import('form-data')).default;
+    const form = new FormData();
+    form.append('media', fs.createReadStream(imagePath));
+
+    const response = await axios.post(
+      `${DINGTALK_OAPI}/media/upload`,
+      form,
+      {
+        params: { access_token: token, type: 'image' },
+        headers: form.getHeaders(),
+      }
+    );
+
+    const mediaId = response.data.media_id;
+    if (mediaId) {
+      log?.debug?.(`[DingTalk] Image uploaded: ${imagePath} -> ${mediaId}`);
+    }
+    return mediaId || null;
+  } catch (err: any) {
+    log?.error?.(`[DingTalk] Image upload failed: ${err.message}`);
+    return null;
+  }
+}
+
+function isLocalFilePath(filePath: string): boolean {
+  return filePath.startsWith('/') && fs.existsSync(filePath);
+}
+
+async function processMediaInText(
+  config: DingTalkConfig,
+  text: string,
+  log?: Logger
+): Promise<string> {
+  if (!config.enableMediaUpload) {
+    return text;
+  }
+
+  const matches = [...text.matchAll(MARKDOWN_IMAGE_REGEX)];
+  if (matches.length === 0) {
+    return text;
+  }
+
+  // Collect unique local paths and their replacements
+  const replacements = new Map<string, string>(); // fullMatch -> replacement
+
+  for (const [fullMatch, alt, imagePath] of matches) {
+    if (!isLocalFilePath(imagePath)) continue;
+    if (replacements.has(fullMatch)) continue; // Already processed this exact match
+
+    // Check cache first to avoid duplicate uploads during streaming
+    let mediaId = getCachedMediaId(config.clientId, imagePath);
+    if (!mediaId) {
+      mediaId = await uploadImageToDingTalk(config, imagePath, log);
+      if (mediaId) {
+        cacheMediaId(config.clientId, imagePath, mediaId);
+      }
+    }
+
+    if (mediaId) {
+      replacements.set(fullMatch, `![${alt}](${mediaId})`);
+    }
+  }
+
+  // Apply all replacements using split/join to replace all occurrences
+  let result = text;
+  for (const [fullMatch, replacement] of replacements) {
+    result = result.split(fullMatch).join(replacement);
+  }
+
+  return result;
 }
 
 function extractMessageContent(data: DingTalkInboundMessage): MessageContent {
@@ -674,10 +890,10 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
 
   log?.debug?.('[DingTalk] Full Inbound Data:', JSON.stringify(maskSensitiveData(data)));
 
-  // 0. 清理过期的卡片缓存
+  // Clean up expired card cache
   cleanupCardCache();
 
-  // 1. 过滤机器人自身消息
+  // Filter out robot self-messages
   if (data.senderId === data.chatbotUserId || data.senderStaffId === data.chatbotUserId) {
     log?.debug?.('[DingTalk] Ignoring robot self-message');
     return;
@@ -752,19 +968,25 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
     peer: { kind: isDirect ? 'dm' : 'group', id: isDirect ? senderId : groupId },
   });
 
+  // Note: /new command is handled by backend openclawd, not intercepted here
+  const effectiveSessionKey = route.sessionKey;
+
   const storePath = rt.channel.session.resolveStorePath(cfg.session?.store, { agentId: route.agentId });
   const envelopeOptions = rt.channel.reply.resolveEnvelopeFormatOptions(cfg);
-  const previousTimestamp = rt.channel.session.readSessionUpdatedAt({ storePath, sessionKey: route.sessionKey });
+  const previousTimestamp = rt.channel.session.readSessionUpdatedAt({ storePath, sessionKey: effectiveSessionKey });
 
   // Group-specific: resolve config, track members, format member list
   const groupConfig = !isDirect ? resolveGroupConfig(dingtalkConfig, groupId) : undefined;
   // GroupSystemPrompt is injected into the system prompt on every turn (unlike
   // group intro which only fires on the first turn). Embed DingTalk IDs here so
   // the AI always has access to conversationId.
+  // Also inject media upload system prompt if enabled.
+  const mediaPrompt = dingtalkConfig.enableMediaUpload ? MEDIA_UPLOAD_SYSTEM_PROMPT : undefined;
   const groupSystemPrompt = !isDirect ? [
     `DingTalk group context: conversationId=${groupId}`,
     groupConfig?.systemPrompt?.trim(),
-  ].filter(Boolean).join('\n') : undefined;
+    mediaPrompt,
+  ].filter(Boolean).join('\n\n') : (mediaPrompt || undefined);
 
   if (!isDirect) {
     noteGroupMember(storePath, groupId, senderId, senderName);
@@ -878,8 +1100,13 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
       responsePrefix: '',
       deliver: async (payload: any) => {
         try {
-          const textToSend = payload.markdown || payload.text;
+          let textToSend = payload.markdown || payload.text;
           if (!textToSend) return;
+
+          // 处理本地媒体上传
+          if (dingtalkConfig.enableMediaUpload) {
+            textToSend = await processMediaInText(dingtalkConfig, textToSend, log);
+          }
 
           lastCardContent = textToSend;
           await sendMessage(dingtalkConfig, to, textToSend, {
@@ -1021,14 +1248,20 @@ export const dingtalkPlugin = {
           error: new Error('DingTalk message requires --to <conversationId>'),
         };
       }
-      // Strip group: prefix and resolve original case
-      const resolved = resolveOriginalPeerId(trimmed.replace(/^group:/, ''));
+      // Strip group: or user: prefix and resolve original case
+      const { targetId } = stripTargetPrefix(trimmed);
+      const resolved = resolveOriginalPeerId(targetId);
       return { ok: true, to: resolved };
     },
     sendText: async ({ cfg, to, text, accountId, log }: any) => {
       const config = getConfig(cfg, accountId);
       try {
-        const result = await sendMessage(config, to, text, { log, accountId });
+        // Process local media uploads for outbound messages
+        let processedText = text;
+        if (config.enableMediaUpload) {
+          processedText = await processMediaInText(config, text, log);
+        }
+        const result = await sendMessage(config, to, processedText, { log, accountId });
         return result.ok ? { ok: true, data: result.data } : { ok: false, error: result.error };
       } catch (err: any) {
         return { ok: false, error: err.response?.data || err.message };
@@ -1073,6 +1306,17 @@ export const dingtalkPlugin = {
             client.socketCallBackResponse(messageId, { success: true });
           }
           const data = JSON.parse(res.data) as DingTalkInboundMessage;
+
+          // Message deduplication: skip if already processed
+          const dedupKey = data.msgId || messageId;
+          if (dedupKey && isMessageProcessed(dedupKey)) {
+            ctx.log?.debug?.(`[DingTalk] Skipping duplicate message: ${dedupKey}`);
+            return;
+          }
+          if (dedupKey) {
+            markMessageProcessed(dedupKey);
+          }
+
           await handleDingTalkMessage({
             cfg,
             accountId: account.accountId,

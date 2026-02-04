@@ -27,6 +27,7 @@ export interface DingTalkConfig extends OpenClawConfig {
   allowFrom?: string[];
   showThinking?: boolean;
   debug?: boolean;
+  enableMediaUpload?: boolean;
   messageType?: 'markdown' | 'card';
   cardTemplateId?: string;
   groups?: Record<string, { systemPrompt?: string }>;
@@ -48,6 +49,7 @@ export interface DingTalkChannelConfig {
   allowFrom?: string[];
   showThinking?: boolean;
   debug?: boolean;
+  enableMediaUpload?: boolean;
   messageType?: 'markdown' | 'card';
   cardTemplateId?: string;
   groups?: Record<string, { systemPrompt?: string }>;
