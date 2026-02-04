@@ -606,8 +606,9 @@ async function uploadImageToDingTalk(
 }
 
 /**
- * Resolve image path from sandbox path to actual filesystem path
- * Sandbox uses /workspace/... which maps to the agent's workspace directory
+ * Resolve image path from sandbox/relative path to actual filesystem path
+ * - Sandbox uses /workspace/... which maps to the agent's workspace directory
+ * - Relative paths (e.g., meme.jpg, ./media/meme.jpg) are resolved relative to workspace
  */
 function resolveImagePath(imagePath: string, workspacePath?: string): string {
   // Handle sandbox /workspace/... paths
@@ -619,11 +620,16 @@ function resolveImagePath(imagePath: string, workspacePath?: string): string {
   if (imagePath === '/workspace' && workspacePath) {
     return workspacePath;
   }
+  // Handle relative paths (not starting with /)
+  if (!imagePath.startsWith('/') && workspacePath) {
+    // Remove leading ./ if present
+    const cleanPath = imagePath.startsWith('./') ? imagePath.slice(2) : imagePath;
+    return path.join(workspacePath, cleanPath);
+  }
   return imagePath;
 }
 
 function isLocalFilePath(filePath: string, workspacePath?: string): boolean {
-  if (!filePath.startsWith('/')) return false;
   const resolvedPath = resolveImagePath(filePath, workspacePath);
   return fs.existsSync(resolvedPath);
 }
