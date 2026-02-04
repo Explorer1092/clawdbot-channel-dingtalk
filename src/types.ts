@@ -29,13 +29,43 @@ export interface DingTalkConfig extends OpenClawConfig {
   debug?: boolean;
   messageType?: 'markdown' | 'card';
   cardTemplateId?: string;
+  groups?: Record<string, { systemPrompt?: string }>;
   accounts?: Record<string, DingTalkConfig>;
 }
 
 /**
- * DingTalk token info (used for both API responses and caching)
+ * Multi-account DingTalk configuration wrapper
+ */
+export interface DingTalkChannelConfig {
+  enabled?: boolean;
+  clientId: string;
+  clientSecret: string;
+  robotCode?: string;
+  corpId?: string;
+  agentId?: string;
+  dmPolicy?: 'open' | 'pairing' | 'allowlist';
+  groupPolicy?: 'open' | 'allowlist';
+  allowFrom?: string[];
+  showThinking?: boolean;
+  debug?: boolean;
+  messageType?: 'markdown' | 'card';
+  cardTemplateId?: string;
+  groups?: Record<string, { systemPrompt?: string }>;
+  accounts?: Record<string, DingTalkConfig>;
+}
+
+/**
+ * DingTalk token info for caching
  */
 export interface TokenInfo {
+  accessToken: string;
+  expireIn: number;
+}
+
+/**
+ * DingTalk API token response
+ */
+export interface TokenResponse {
   accessToken: string;
   expireIn: number;
 }
