@@ -605,14 +605,34 @@ async function uploadImageToDingTalk(
   }
 }
 
-function isLocalFilePath(filePath: string): boolean {
-  return filePath.startsWith('/') && fs.existsSync(filePath);
+/**
+ * Resolve image path from sandbox path to actual filesystem path
+ * Sandbox uses /workspace/... which maps to the agent's workspace directory
+ */
+function resolveImagePath(imagePath: string, workspacePath?: string): string {
+  // Handle sandbox /workspace/... paths
+  if (imagePath.startsWith('/workspace/') && workspacePath) {
+    const relativePath = imagePath.slice('/workspace/'.length);
+    return path.join(workspacePath, relativePath);
+  }
+  // Handle sandbox /workspace path (exact match)
+  if (imagePath === '/workspace' && workspacePath) {
+    return workspacePath;
+  }
+  return imagePath;
+}
+
+function isLocalFilePath(filePath: string, workspacePath?: string): boolean {
+  if (!filePath.startsWith('/')) return false;
+  const resolvedPath = resolveImagePath(filePath, workspacePath);
+  return fs.existsSync(resolvedPath);
 }
 
 async function processMediaInText(
   config: DingTalkConfig,
   text: string,
-  log?: Logger
+  log?: Logger,
+  workspacePath?: string
 ): Promise<string> {
   if (!config.enableMediaUpload) {
     log?.debug?.('[DingTalk][Media] enableMediaUpload=false, skipping');
@@ -625,32 +645,33 @@ async function processMediaInText(
     return text;
   }
 
-  log?.info?.(`[DingTalk][Media] Found ${matches.length} markdown image(s) in text`);
+  log?.info?.(`[DingTalk][Media] Found ${matches.length} markdown image(s) in text, workspacePath=${workspacePath}`);
 
   // Collect unique local paths and their replacements
   const replacements = new Map<string, string>(); // fullMatch -> replacement
 
   for (const [fullMatch, alt, imagePath] of matches) {
-    log?.debug?.(`[DingTalk][Media] Checking image: path="${imagePath}", exists=${fs.existsSync(imagePath)}, startsWithSlash=${imagePath.startsWith('/')}`);
+    const resolvedPath = resolveImagePath(imagePath, workspacePath);
+    log?.debug?.(`[DingTalk][Media] Checking image: path="${imagePath}", resolved="${resolvedPath}", exists=${fs.existsSync(resolvedPath)}, startsWithSlash=${imagePath.startsWith('/')}`);
 
-    if (!isLocalFilePath(imagePath)) {
+    if (!isLocalFilePath(imagePath, workspacePath)) {
       log?.debug?.(`[DingTalk][Media] Skipping non-local path: ${imagePath}`);
       continue;
     }
     if (replacements.has(fullMatch)) continue; // Already processed this exact match
 
     // Check cache first to avoid duplicate uploads during streaming
-    let mediaId = getCachedMediaId(config.clientId, imagePath);
+    let mediaId = getCachedMediaId(config.clientId, resolvedPath);
     if (mediaId) {
-      log?.debug?.(`[DingTalk][Media] Using cached media_id for ${imagePath}`);
+      log?.debug?.(`[DingTalk][Media] Using cached media_id for ${resolvedPath}`);
     } else {
-      log?.info?.(`[DingTalk][Media] Uploading image: ${imagePath}`);
-      mediaId = await uploadImageToDingTalk(config, imagePath, log);
+      log?.info?.(`[DingTalk][Media] Uploading image: ${resolvedPath}`);
+      mediaId = await uploadImageToDingTalk(config, resolvedPath, log);
       if (mediaId) {
-        cacheMediaId(config.clientId, imagePath, mediaId);
-        log?.info?.(`[DingTalk][Media] Upload success: ${imagePath} -> ${mediaId}`);
+        cacheMediaId(config.clientId, resolvedPath, mediaId);
+        log?.info?.(`[DingTalk][Media] Upload success: ${resolvedPath} -> ${mediaId}`);
       } else {
-        log?.warn?.(`[DingTalk][Media] Upload failed for: ${imagePath}`);
+        log?.warn?.(`[DingTalk][Media] Upload failed for: ${resolvedPath}`);
       }
     }
 
@@ -1256,9 +1277,9 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
           let textToSend = payload.markdown || payload.text;
           if (!textToSend) return;
 
-          // 处理本地媒体上传
+          // 处理本地媒体上传（将沙箱 /workspace 路径映射到实际 workspacePath）
           if (dingtalkConfig.enableMediaUpload) {
-            textToSend = await processMediaInText(dingtalkConfig, textToSend, log);
+            textToSend = await processMediaInText(dingtalkConfig, textToSend, log, workspacePath);
           }
 
           lastCardContent = textToSend;
