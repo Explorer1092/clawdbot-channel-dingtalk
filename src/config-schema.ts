@@ -42,7 +42,7 @@ export const DingTalkConfigSchema = z.object({
   debug: z.boolean().optional().default(false),
 
   /** Enable local media upload (auto-upload local images to DingTalk) */
-  enableMediaUpload: z.boolean().optional().default(false),
+  enableMediaUpload: z.boolean().optional().default(true),
 
   /** Message type for replies: markdown or card */
   messageType: z.enum(['markdown', 'card']).optional().default('markdown'),

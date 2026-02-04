@@ -77,19 +77,23 @@ function markMessageProcessed(messageId: string): void {
 
 // ============ Media Upload System Prompt ============
 
-const MEDIA_UPLOAD_SYSTEM_PROMPT = `## 钉钉媒体输出规则
+const MEDIA_UPLOAD_SYSTEM_PROMPT = `## 钉钉图片发送规则
 
-输出图片时，直接使用本地文件路径，系统会自动上传：
+发送图片时，必须使用 Markdown 图片语法，路径使用绝对路径：
 
-**正确方式**：
-- ![描述](/path/to/image.png)
-- ![描述](/tmp/screenshot.jpg)
+\`\`\`
+![描述文字](/absolute/path/to/image.png)
+\`\`\`
 
-**禁止**：
-- 不要猜测或构造 URL
-- 不要对路径添加转义字符
+**示例**：
+- ![截图](/workspace/screenshot.png)
+- ![表情包](/workspace/memes/funny.jpg)
 
-直接输出本地路径即可。`;
+**注意**：
+- 必须使用 \`![...](/path)\` 格式，系统会自动上传到钉钉
+- 路径必须以 \`/\` 开头（绝对路径）
+- 不要使用 \`MEDIA:\` 前缀或其他自定义格式
+- 不要使用 URL，只使用本地文件路径`;
 
 // ============ OAPI Access Token (for media upload) ============
 
