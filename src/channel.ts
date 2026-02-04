@@ -259,9 +259,9 @@ async function sendProactiveTextOrMarkdown(
   const msgKey = useMarkdown ? 'sampleMarkdown' : 'sampleText';
 
   // sampleText uses { content } format; sampleMarkdown uses { title, text }
-  const msgParam = msgKey === 'sampleText'
-    ? JSON.stringify({ content: text })
-    : JSON.stringify({ title, text });
+  const msgParam = useMarkdown
+    ? JSON.stringify({ title, text })
+    : JSON.stringify({ content: text });
 
   const payload: ProactiveMessagePayload = {
     robotCode: config.robotCode || config.clientId,
