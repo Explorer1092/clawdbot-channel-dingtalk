@@ -375,6 +375,11 @@ interface AgentConfig {
   id?: string;
   default?: boolean;
   workspace?: string;
+  sandbox?: {
+    docker?: {
+      workdir?: string;
+    };
+  };
 }
 
 function resolveDefaultAgentId(cfg: OpenClawConfig): string {
@@ -398,6 +403,30 @@ function resolveAgentWorkspaceDir(cfg: OpenClawConfig, agentId: string): string 
     return resolveDefaultAgentWorkspaceDir();
   }
   return path.join(os.homedir(), '.openclaw', `workspace-${id}`);
+}
+
+/**
+ * Resolve sandbox container workdir from OpenClaw config
+ * This is the path prefix used inside the sandbox container (default: /workspace)
+ * Agent-level config takes precedence over global defaults
+ */
+function resolveSandboxWorkdir(cfg: OpenClawConfig, agentId?: string): string {
+  const DEFAULT_SANDBOX_WORKDIR = '/workspace';
+  const agents: AgentConfig[] = cfg.agents?.list ?? [];
+
+  // Try agent-specific sandbox config first
+  if (agentId) {
+    const id = normalizeAgentId(agentId);
+    const agent = agents.find((entry: AgentConfig) => normalizeAgentId(entry?.id) === id);
+    const agentWorkdir = (agent?.sandbox as any)?.docker?.workdir;
+    if (agentWorkdir) return agentWorkdir;
+  }
+
+  // Fall back to global defaults
+  const globalWorkdir = (cfg.agents?.defaults?.sandbox as any)?.docker?.workdir;
+  if (globalWorkdir) return globalWorkdir;
+
+  return DEFAULT_SANDBOX_WORKDIR;
 }
 
 // Get Access Token with retry logic
@@ -607,17 +636,22 @@ async function uploadImageToDingTalk(
 
 /**
  * Resolve image path from sandbox/relative path to actual filesystem path
- * - Sandbox uses /workspace/... which maps to the agent's workspace directory
+ * - Sandbox uses configurable workdir (default /workspace) which maps to the agent's workspace directory
  * - Relative paths (e.g., meme.jpg, ./media/meme.jpg) are resolved relative to workspace
+ * @param imagePath - The image path from AI output
+ * @param workspacePath - The actual filesystem workspace path
+ * @param sandboxWorkdir - The sandbox container workdir prefix (from OpenClaw config, default /workspace)
  */
-function resolveImagePath(imagePath: string, workspacePath?: string): string {
-  // Handle sandbox /workspace/... paths
-  if (imagePath.startsWith('/workspace/') && workspacePath) {
-    const relativePath = imagePath.slice('/workspace/'.length);
+function resolveImagePath(imagePath: string, workspacePath?: string, sandboxWorkdir?: string): string {
+  const prefix = sandboxWorkdir ?? '/workspace';
+
+  // Handle sandbox workdir paths (e.g., /workspace/media/image.jpg)
+  if (imagePath.startsWith(prefix + '/') && workspacePath) {
+    const relativePath = imagePath.slice(prefix.length + 1);
     return path.join(workspacePath, relativePath);
   }
-  // Handle sandbox /workspace path (exact match)
-  if (imagePath === '/workspace' && workspacePath) {
+  // Handle sandbox workdir path (exact match)
+  if (imagePath === prefix && workspacePath) {
     return workspacePath;
   }
   // Handle relative paths (not starting with /)
@@ -629,8 +663,8 @@ function resolveImagePath(imagePath: string, workspacePath?: string): string {
   return imagePath;
 }
 
-function isLocalFilePath(filePath: string, workspacePath?: string): boolean {
-  const resolvedPath = resolveImagePath(filePath, workspacePath);
+function isLocalFilePath(filePath: string, workspacePath?: string, sandboxWorkdir?: string): boolean {
+  const resolvedPath = resolveImagePath(filePath, workspacePath, sandboxWorkdir);
   return fs.existsSync(resolvedPath);
 }
 
@@ -638,7 +672,8 @@ async function processMediaInText(
   config: DingTalkConfig,
   text: string,
   log?: Logger,
-  workspacePath?: string
+  workspacePath?: string,
+  sandboxWorkdir?: string
 ): Promise<string> {
   if (!config.enableMediaUpload) {
     log?.debug?.('[DingTalk][Media] enableMediaUpload=false, skipping');
@@ -651,16 +686,16 @@ async function processMediaInText(
     return text;
   }
 
-  log?.info?.(`[DingTalk][Media] Found ${matches.length} markdown image(s) in text, workspacePath=${workspacePath}`);
+  log?.info?.(`[DingTalk][Media] Found ${matches.length} markdown image(s) in text, workspacePath=${workspacePath}, sandboxWorkdir=${sandboxWorkdir}`);
 
   // Collect unique local paths and their replacements
   const replacements = new Map<string, string>(); // fullMatch -> replacement
 
   for (const [fullMatch, alt, imagePath] of matches) {
-    const resolvedPath = resolveImagePath(imagePath, workspacePath);
-    log?.debug?.(`[DingTalk][Media] Checking image: path="${imagePath}", resolved="${resolvedPath}", exists=${fs.existsSync(resolvedPath)}, startsWithSlash=${imagePath.startsWith('/')}`);
+    const resolvedPath = resolveImagePath(imagePath, workspacePath, sandboxWorkdir);
+    log?.debug?.(`[DingTalk][Media] Checking image: path="${imagePath}", resolved="${resolvedPath}", exists=${fs.existsSync(resolvedPath)}`);
 
-    if (!isLocalFilePath(imagePath, workspacePath)) {
+    if (!isLocalFilePath(imagePath, workspacePath, sandboxWorkdir)) {
       log?.debug?.(`[DingTalk][Media] Skipping non-local path: ${imagePath}`);
       continue;
     }
@@ -1141,6 +1176,7 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
 
   const storePath = rt.channel.session.resolveStorePath(cfg.session?.store, { agentId: route.agentId });
   const workspacePath = resolveAgentWorkspaceDir(cfg, route.agentId);
+  const sandboxWorkdir = resolveSandboxWorkdir(cfg, route.agentId);
 
   // Download media to agent workspace (must be after route is resolved for correct workspace)
   let mediaPath: string | undefined;
@@ -1283,9 +1319,9 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
           let textToSend = payload.markdown || payload.text;
           if (!textToSend) return;
 
-          // 处理本地媒体上传（将沙箱 /workspace 路径映射到实际 workspacePath）
+          // 处理本地媒体上传（将沙箱路径映射到实际 workspacePath）
           if (dingtalkConfig.enableMediaUpload) {
-            textToSend = await processMediaInText(dingtalkConfig, textToSend, log, workspacePath);
+            textToSend = await processMediaInText(dingtalkConfig, textToSend, log, workspacePath, sandboxWorkdir);
           }
 
           lastCardContent = textToSend;
@@ -1429,9 +1465,13 @@ export const dingtalkPlugin = {
       const config = getConfig(cfg, accountId);
       try {
         // Process local media uploads for outbound messages
+        // Use default agent's workspace since outbound context doesn't have agentId
         let processedText = text;
         if (config.enableMediaUpload) {
-          processedText = await processMediaInText(config, text, log);
+          const defaultAgentId = resolveDefaultAgentId(cfg);
+          const workspacePath = resolveAgentWorkspaceDir(cfg, defaultAgentId);
+          const sandboxWorkdir = resolveSandboxWorkdir(cfg, defaultAgentId);
+          processedText = await processMediaInText(config, text, log, workspacePath, sandboxWorkdir);
         }
         const result = await sendMessage(config, to, processedText, { log, accountId });
         return result.ok ? { ok: true, data: result.data } : { ok: false, error: result.error };
