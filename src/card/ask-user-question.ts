@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
+import type { OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk/core";
 import { getAccessToken } from "../auth";
 import { updateCardVariables } from "../card-callback-service";
 import { resolveRobotCode } from "../config";
@@ -1233,7 +1233,7 @@ export function registerDingTalkAskUserQuestionTool(api: OpenClawPluginApi): voi
     return;
   }
 
-  registerTool.call(api, {
+  const createTool = (context: DingTalkQuestionContext | undefined) => ({
     name: TOOL_NAME,
     label: "Ask User Question",
     description:
@@ -1247,7 +1247,6 @@ export function registerDingTalkAskUserQuestionTool(api: OpenClawPluginApi): voi
       "Do not call this tool for normal explanations, why/how questions, capability introductions, or cases where you can answer directly.",
     parameters: AskUserQuestionSchema as any,
     async execute(_toolCallId: string, params: unknown) {
-      const context = getDingTalkQuestionContext();
       if (!context) {
         return jsonToolResult({
           status: "failed",
@@ -1410,5 +1409,21 @@ export function registerDingTalkAskUserQuestionTool(api: OpenClawPluginApi): voi
       });
     },
   });
+  registerTool.call(
+    api,
+    (toolContext: OpenClawPluginToolContext) => {
+      // Capture the inbound run's context while the factory is still inside its
+      // AsyncLocalStorage scope; shared agent clients may execute the tool later.
+      const context = getDingTalkQuestionContext();
+      const runtimeSessionKey = toolContext.sessionKey?.trim();
+      const contextSessionKey = context?.resolvedRoute?.sessionKey.trim();
+      return createTool(
+        context && (!runtimeSessionKey || contextSessionKey === runtimeSessionKey)
+          ? context
+          : undefined,
+      );
+    },
+    { name: TOOL_NAME },
+  );
   api.logger?.debug?.(`${TOOL_NAME}: registered tool`);
 }
