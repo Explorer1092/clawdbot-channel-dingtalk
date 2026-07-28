@@ -351,10 +351,13 @@ interface CreateAICardOptions {
   statusLine?: string;
 }
 
+type PendingCardRecoveryAction = "finalize" | "recall";
+
 interface PendingCardRecord {
   accountId: string;
   cardInstanceId: string;
   outTrackId?: string;
+  processQueryKey?: string;
   conversationId: string;
   contextConversationId?: string;
   createdAt: number;
@@ -363,6 +366,8 @@ interface PendingCardRecord {
   lastContent?: string;
   lastBlockListJson?: string;
   streamLifecycleOpened?: boolean;
+  /** Recovery action to retry after a remote card update failed. */
+  recoveryAction?: PendingCardRecoveryAction;
 }
 
 interface PendingCardStateFile {
@@ -399,10 +404,12 @@ function normalizePendingState(parsed: Partial<PendingCardStateFile>): PendingCa
         typeof entry.accountId === "string" &&
         typeof entry.cardInstanceId === "string" &&
         (entry.outTrackId === undefined || typeof entry.outTrackId === "string") &&
+        (entry.processQueryKey === undefined || typeof entry.processQueryKey === "string") &&
         typeof entry.conversationId === "string" &&
         (entry.lastContent === undefined || typeof entry.lastContent === "string") &&
         (entry.lastBlockListJson === undefined || typeof entry.lastBlockListJson === "string") &&
-        (entry.streamLifecycleOpened === undefined || typeof entry.streamLifecycleOpened === "boolean"),
+        (entry.streamLifecycleOpened === undefined || typeof entry.streamLifecycleOpened === "boolean") &&
+        (entry.recoveryAction === undefined || entry.recoveryAction === "finalize" || entry.recoveryAction === "recall"),
       ),
     ),
   };
@@ -469,6 +476,7 @@ function upsertPendingCard(card: AICardInstance, storePath?: string, log?: Logge
     accountId: card.accountId,
     cardInstanceId: card.cardInstanceId,
     outTrackId: card.outTrackId,
+    processQueryKey: card.processQueryKey,
     conversationId: card.conversationId,
     contextConversationId: card.contextConversationId,
     createdAt: card.createdAt,
@@ -537,6 +545,33 @@ function removePendingCardById(cardInstanceId: string, storePath?: string, log?:
   state.pendingCards = remaining;
   state.updatedAt = Date.now();
   writePendingCardState(state, storePath, log);
+}
+
+function retainPendingCardForRecovery(
+  card: AICardInstance,
+  recoveryAction: PendingCardRecoveryAction,
+  log?: Logger,
+): void {
+  if (!card.accountId || !card.storePath) {
+    return;
+  }
+  const state = readPendingCardState(card.storePath, log);
+  const index = state.pendingCards.findIndex((item) => item.cardInstanceId === card.cardInstanceId);
+  if (index < 0) {
+    return;
+  }
+  const existing = state.pendingCards[index];
+  state.pendingCards[index] = {
+    ...existing,
+    state: AICardStatus.FAILED,
+    lastUpdated: Date.now(),
+    lastContent: card.lastStreamedContent ?? existing.lastContent,
+    lastBlockListJson: card.lastBlockListJson ?? existing.lastBlockListJson,
+    streamLifecycleOpened: card.streamLifecycleOpened,
+    recoveryAction,
+  };
+  state.updatedAt = Date.now();
+  writePendingCardState(state, card.storePath, log);
 }
 
 function listPendingCardsByAccount(
@@ -713,7 +748,9 @@ async function finalizePendingCardsByAccount(
   }
 
   const pendingCards = listPendingCardsByAccount(accountId, storePath, log).filter(
-    (item) => !isCardInTerminalState(item.state),
+    (item) =>
+      (item.recoveryAction === "recall" && mode === "recover")
+      || (item.recoveryAction !== "recall" && (!isCardInTerminalState(item.state) || item.recoveryAction === "finalize")),
   );
   if (pendingCards.length === 0) {
     return 0;
@@ -741,6 +778,7 @@ async function finalizePendingCardsByAccount(
       accountId: entry.accountId,
       storePath,
       outTrackId: entry.outTrackId,
+      processQueryKey: entry.processQueryKey,
       createdAt: entry.createdAt || Date.now(),
       lastUpdated: entry.lastUpdated || Date.now(),
       state: normalizeRecoveredState(entry.state),
@@ -750,6 +788,12 @@ async function finalizePendingCardsByAccount(
       streamLifecycleOpened: entry.streamLifecycleOpened,
     };
     try {
+      if (entry.recoveryAction === "recall") {
+        if (await recallAICardMessage(card, log)) {
+          finalizedCount += 1;
+        }
+        continue;
+      }
       await finalizeStoppedAICard(card, {
         reason,
         previousContent: entry.lastContent,
@@ -1163,6 +1207,11 @@ export async function commitAICardBlocks(
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     log?.error?.(`[DingTalk][AICard] Finalize via instances API failed: ${message}`);
+    // The caller cannot finish this card now. Persist a terminal-only recovery
+    // marker so startup retries the neutral close, never the original reply.
+    card.state = AICardStatus.FAILED;
+    card.lastUpdated = Date.now();
+    retainPendingCardForRecovery(card, "finalize", log);
     throw err;
   }
 
@@ -1193,6 +1242,7 @@ export async function streamAICard(
   content: string,
   finished: boolean = false,
   log?: Logger,
+  options: { recoveryAction?: PendingCardRecoveryAction } = {},
 ): Promise<void> {
   if (isCardInTerminalState(card.state)) {
     log?.debug?.(
@@ -1215,7 +1265,9 @@ export async function streamAICard(
   } catch (err: any) {
     card.state = AICardStatus.FAILED;
     card.lastUpdated = Date.now();
-    removePendingCard(card, log);
+    // The remote card may still be visible after any update fails. Keep it
+    // recoverable so startup can close it instead of leaving an orphaned card.
+    retainPendingCardForRecovery(card, options.recoveryAction ?? "finalize", log);
     if (err.response?.status === 500 && err.response?.data?.code === "unknownError") {
       const errorMsg =
         "⚠️ **[DingTalk] AI Card 串流更新失败 (500 unknownError)**\n\n"
