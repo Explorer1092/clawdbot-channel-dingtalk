@@ -70,9 +70,11 @@ jobs:
 
                   echo "Version check passed: ${TAG} -> ${PACKAGE_VERSION} (ClawHub tag: ${CLAWHUB_TAG})"
                   echo "clawhub_tag=${CLAWHUB_TAG}" >> "$GITHUB_OUTPUT"
+                  echo "package_version=${PACKAGE_VERSION}" >> "$GITHUB_OUTPUT"
+                  echo "package_path=$(node -p "encodeURIComponent(require('./package.json').name)")" >> "$GITHUB_OUTPUT"
 
             - name: Install ClawHub CLI
-              run: npm install --global clawhub@0.9.0
+              run: npm install --global clawhub@0.23.1
 
             - name: Authenticate ClawHub CLI
               env:
@@ -122,4 +124,29 @@ jobs:
                     --source-repo "${GITHUB_REPOSITORY}" \
                     --source-commit "${GITHUB_SHA}" \
                     --source-ref "${SOURCE_REF}" \
-                    --source-path "."
+                    --source-path "." \
+                    --json
+
+            - name: Verify ClawHub publication
+              env:
+                  CLAWHUB_TAG: ${{ steps.release.outputs.clawhub_tag }}
+                  PACKAGE_PATH: ${{ steps.release.outputs.package_path }}
+                  PACKAGE_VERSION: ${{ steps.release.outputs.package_version }}
+              run: |
+                  set -euo pipefail
+
+                  for attempt in {1..18}; do
+                    if VERSION_JSON="$(curl -fsS "https://clawhub.ai/api/v1/packages/${PACKAGE_PATH}/versions/${PACKAGE_VERSION}")" && \
+                       PACKAGE_JSON="$(curl -fsS "https://clawhub.ai/api/v1/packages/${PACKAGE_PATH}")" && \
+                       jq -e --arg version "${PACKAGE_VERSION}" '.version.version == $version' <<<"${VERSION_JSON}" >/dev/null && \
+                       jq -e --arg tag "${CLAWHUB_TAG}" --arg version "${PACKAGE_VERSION}" '.package.tags[$tag] == $version' <<<"${PACKAGE_JSON}" >/dev/null; then
+                      echo "Verified ClawHub publication: ${PACKAGE_VERSION} (${CLAWHUB_TAG})"
+                      exit 0
+                    fi
+
+                    echo "ClawHub registry not ready (attempt ${attempt}/18); retrying in 10 seconds..."
+                    sleep 10
+                  done
+
+                  echo "::error::ClawHub did not expose ${PACKAGE_VERSION} with tag ${CLAWHUB_TAG} after publication."
+                  exit 1
