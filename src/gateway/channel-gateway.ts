@@ -1,4 +1,5 @@
 import { DWClient, TOPIC_CARD, TOPIC_ROBOT } from "dingtalk-stream";
+import { listAgentIds } from "openclaw/plugin-sdk/agent-runtime";
 import { analyzeCardCallback } from "../card-callback-service";
 import { finalizeActiveCardsForAccount, recoverPendingCardsForAccount } from "../card-service";
 import { recoverAskUserQuestionsForAccount } from "../card/ask-user-question";
@@ -13,9 +14,14 @@ import {
 } from "../feedback-learning-service";
 import { handleDingTalkMessage } from "../inbound-handler";
 import { setCurrentLogger } from "../logger-context";
-import { preloadPeerIdsFromSessions } from "../peer-id-registry";
+import { registerPeerId } from "../peer-id-registry";
 import { getDingTalkRuntime } from "../runtime";
 import { sendProactiveTextOrMarkdown } from "../send-service";
+import {
+  listKnownGroupTargets,
+  listKnownUserTargets,
+  upsertObservedGroupTarget,
+} from "../targeting/target-directory-store";
 import type {
   ConnectionManagerConfig,
   DingTalkChannelPlugin,
@@ -180,6 +186,66 @@ export function createDingTalkGateway(): NonNullable<DingTalkChannelPlugin["gate
         debug: config.debug,
         baseLog: ctx.log,
       });
+      try {
+        const knownGroupIds = new Set<string>();
+        for (const group of listKnownGroupTargets({
+          storePath: accountStorePath,
+          accountId: account.accountId,
+        })) {
+          registerPeerId(group.conversationId);
+          knownGroupIds.add(group.conversationId.toLowerCase());
+        }
+        const runtime = getDingTalkRuntime();
+        for (const agentId of listAgentIds(cfg)) {
+          const sessionStorePath = runtime.channel.session.resolveStorePath(cfg.session?.store, {
+            agentId,
+          });
+          for (const { entry } of runtime.agent.session.listSessionEntries({
+            agentId,
+            storePath: sessionStorePath,
+            readConsistency: "latest",
+          })) {
+            const isDingTalkSession = [
+              entry.lastChannel,
+              entry.channel,
+              entry.origin?.provider,
+              entry.origin?.surface,
+            ].some((value) => value === "dingtalk");
+            const sessionAccountId = entry.lastAccountId || entry.origin?.accountId;
+            if (!isDingTalkSession || sessionAccountId !== account.accountId) {
+              continue;
+            }
+            for (const peerId of [entry.lastTo, entry.origin?.from, entry.origin?.to]) {
+              if (typeof peerId !== "string" || !peerId.startsWith("cid")) {
+                continue;
+              }
+              registerPeerId(peerId);
+              const normalizedPeerId = peerId.toLowerCase();
+              if (!knownGroupIds.has(normalizedPeerId)) {
+                upsertObservedGroupTarget({
+                  storePath: accountStorePath,
+                  accountId: account.accountId,
+                  conversationId: peerId,
+                  seenAt: entry.updatedAt,
+                });
+                knownGroupIds.add(normalizedPeerId);
+              }
+            }
+          }
+        }
+        for (const user of listKnownUserTargets({
+          storePath: accountStorePath,
+          accountId: account.accountId,
+        })) {
+          registerPeerId(user.canonicalUserId);
+          registerPeerId(user.staffId || "");
+          registerPeerId(user.senderId);
+        }
+      } catch (err: unknown) {
+        pluginLog?.warn?.(
+          `[${account.accountId}] Failed to restore peer IDs: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
       // Stream credentials are resolved once per account start. If a file
       // SecretInput rotates, restart the gateway/account so reconnects use the
       // new secret.
@@ -187,9 +253,6 @@ export function createDingTalkGateway(): NonNullable<DingTalkChannelPlugin["gate
       setCurrentLogger(pluginLog, account.accountId);
 
       pluginLog?.info?.(`[${account.accountId}] Initializing DingTalk Stream client...`);
-
-      preloadPeerIdsFromSessions();
-      pluginLog?.debug?.(`[${account.accountId}] Peer ID registry preloaded from sessions`);
 
       cleanupOrphanedTempFiles(pluginLog);
       try {

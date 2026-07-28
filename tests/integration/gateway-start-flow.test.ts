@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const shared = vi.hoisted(() => ({
     connectMock: vi.fn(),
@@ -12,7 +15,9 @@ const shared = vi.hoisted(() => ({
     clientGetEndpointMock: vi.fn(),
     clientConnectMock: vi.fn(),
     clientDisconnectMock: vi.fn(),
+    listSessionEntriesMock: vi.fn(),
     dwClientConfig: undefined as any,
+    storePath: undefined as string | undefined,
 }));
 
 vi.mock('openclaw/plugin-sdk/core', () => ({
@@ -78,6 +83,13 @@ vi.mock('../../src/utils', async () => {
 });
 
 import { dingtalkPlugin } from '../../src/channel';
+import { clearPeerIdRegistry, resolveOriginalPeerId } from '../../src/peer-id-registry';
+import { setDingTalkRuntime } from '../../src/runtime';
+import {
+    clearTargetDirectoryStateCache,
+    upsertObservedGroupTarget,
+    upsertObservedUserTarget,
+} from '../../src/targeting/target-directory-store';
 
 const startGatewayAccount = (ctx: any): Promise<any> => dingtalkPlugin.gateway!.startAccount!(ctx as any);
 
@@ -129,14 +141,38 @@ describe('gateway.startAccount lifecycle', () => {
         shared.clientGetEndpointMock.mockReset();
         shared.clientConnectMock.mockReset();
         shared.clientDisconnectMock.mockReset();
+        shared.listSessionEntriesMock.mockReset();
         shared.dwClientConfig = undefined;
+        shared.storePath = undefined;
 
         shared.connectMock.mockResolvedValue(undefined);
         shared.waitForStopMock.mockResolvedValue(undefined);
         shared.isConnectedMock.mockReturnValue(true);
         shared.clientGetEndpointMock.mockResolvedValue(undefined);
         shared.clientConnectMock.mockResolvedValue(undefined);
+        shared.listSessionEntriesMock.mockReturnValue([]);
         shared.resolvePluginDebugLogMock.mockImplementation(({ baseLog }: any) => baseLog);
+        setDingTalkRuntime({
+            config: { current: () => ({}) },
+            agent: {
+                session: {
+                    listSessionEntries: shared.listSessionEntriesMock,
+                },
+            },
+            channel: {
+                session: {
+                    resolveStorePath: () => shared.storePath,
+                },
+            },
+        } as any);
+        clearPeerIdRegistry();
+        clearTargetDirectoryStateCache();
+    });
+
+    afterEach(() => {
+        if (shared.storePath) {
+            rmSync(shared.storePath, { recursive: true, force: true });
+        }
     });
 
     it('fails fast when abortSignal is already aborted before start', async () => {
@@ -173,6 +209,93 @@ describe('gateway.startAccount lifecycle', () => {
         }));
         expect(shared.stopMock).toHaveBeenCalledTimes(1);
         expect(setStatusCalls.some((s) => s.running === false && s.lastStopAt !== null)).toBe(true);
+    });
+
+    it('restores case-sensitive peer IDs from the persisted target directory', async () => {
+        shared.storePath = mkdtempSync(join(tmpdir(), 'dingtalk-peer-registry-'));
+        upsertObservedGroupTarget({
+            storePath: shared.storePath,
+            accountId: 'main',
+            conversationId: 'CidGroup+AbC',
+        });
+        upsertObservedUserTarget({
+            storePath: shared.storePath,
+            accountId: 'main',
+            senderId: 'UnionUser+XyZ',
+            staffId: 'StaffUser+XyZ',
+        });
+        clearPeerIdRegistry();
+        clearTargetDirectoryStateCache();
+
+        await startGatewayAccount(createStartContext().ctx);
+
+        expect(resolveOriginalPeerId('cidgroup+abc')).toBe('CidGroup+AbC');
+        expect(resolveOriginalPeerId('unionuser+xyz')).toBe('UnionUser+XyZ');
+        expect(resolveOriginalPeerId('staffuser+xyz')).toBe('StaffUser+XyZ');
+    });
+
+    it('migrates historical sessions from configured agents into the target directory', async () => {
+        shared.storePath = mkdtempSync(join(tmpdir(), 'dingtalk-peer-registry-'));
+        shared.listSessionEntriesMock.mockImplementation(({ agentId }: { agentId: string }) =>
+            agentId === 'agent-alpha'
+                ? [
+                    {
+                        sessionKey: 'agent:agent-alpha:dingtalk:group:cidlegacy+abc',
+                        entry: {
+                            sessionId: 'legacy-session',
+                            updatedAt: 1000,
+                            lastChannel: 'dingtalk',
+                            lastAccountId: 'main',
+                            lastTo: 'cidLegacy+AbC',
+                        },
+                    },
+                ]
+                : [],
+        );
+        const { ctx } = createStartContext();
+        ctx.cfg = {
+            agents: {
+                list: [
+                    { id: 'main', default: true },
+                    { id: 'agent-alpha' },
+                ],
+            },
+        } as any;
+
+        await startGatewayAccount(ctx);
+
+        expect(shared.listSessionEntriesMock).toHaveBeenCalledWith({
+            agentId: 'agent-alpha',
+            storePath: shared.storePath,
+            readConsistency: 'latest',
+        });
+        expect(resolveOriginalPeerId('cidlegacy+abc')).toBe('cidLegacy+AbC');
+
+        clearPeerIdRegistry();
+        clearTargetDirectoryStateCache();
+        shared.listSessionEntriesMock.mockReturnValue([]);
+        await startGatewayAccount(ctx);
+
+        expect(resolveOriginalPeerId('cidlegacy+abc')).toBe('cidLegacy+AbC');
+    });
+
+    it('skips historical sessions without an account ID', async () => {
+        shared.storePath = mkdtempSync(join(tmpdir(), 'dingtalk-peer-registry-'));
+        shared.listSessionEntriesMock.mockReturnValue([
+            {
+                sessionKey: 'agent:main:dingtalk:group:cidunscoped+abc',
+                entry: {
+                    sessionId: 'unscoped-session',
+                    updatedAt: 1000,
+                    lastChannel: 'dingtalk',
+                    lastTo: 'cidUnscoped+AbC',
+                },
+            },
+        ]);
+
+        await startGatewayAccount(createStartContext().ctx);
+
+        expect(resolveOriginalPeerId('cidunscoped+abc')).toBe('cidunscoped+abc');
     });
 
     it('handles abort signal by stopping connection manager and setting stopped status', async () => {
