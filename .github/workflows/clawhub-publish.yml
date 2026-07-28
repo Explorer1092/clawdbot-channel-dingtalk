@@ -115,14 +115,14 @@ jobs:
                   CLAWHUB_TAGS: ${{ steps.release.outputs.clawhub_tag }}
                   SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
                   GITHUB_REPOSITORY: ${{ github.repository }}
-                  GITHUB_SHA: ${{ github.sha }}
               run: |
                   set -euo pipefail
+                  SOURCE_COMMIT="$(git rev-parse HEAD)"
 
                   clawhub package publish . \
                     --tags "${CLAWHUB_TAGS}" \
                     --source-repo "${GITHUB_REPOSITORY}" \
-                    --source-commit "${GITHUB_SHA}" \
+                    --source-commit "${SOURCE_COMMIT}" \
                     --source-ref "${SOURCE_REF}" \
                     --source-path "." \
                     --json
@@ -150,3 +150,11 @@ jobs:
 
                   echo "::error::ClawHub did not expose ${PACKAGE_VERSION} with tag ${CLAWHUB_TAG} after publication."
                   exit 1
+
+            - name: Remove incomplete ClawHub 3.6.8 release
+              if: steps.release.outputs.package_version == '3.6.9'
+              env:
+                  CLAWHUB_CONFIG_PATH: ${{ runner.temp }}/clawhub-config.json
+                  CLAWHUB_SITE: https://clawhub.ai
+                  CLAWHUB_REGISTRY: https://clawhub.ai
+              run: clawhub package delete @soimy/dingtalk --version 3.6.8 --yes --json
