@@ -7,11 +7,6 @@ on:
                 description: Existing git tag to publish, for example v3.5.0
                 required: true
                 type: string
-            diagnose_only:
-                description: Inspect ClawHub moderation state without publishing
-                required: false
-                default: false
-                type: boolean
     push:
         tags:
             - "*"
@@ -97,32 +92,22 @@ jobs:
 
                   clawhub auth login --token "${CLAWHUB_TOKEN}" --no-browser
 
-            - name: Inspect ClawHub moderation status
-              if: github.event_name == 'workflow_dispatch' && inputs.diagnose_only
-              run: clawhub package moderation-status @soimy/dingtalk --json
-
             - name: Type check
-              if: github.event_name != 'workflow_dispatch' || !inputs.diagnose_only
               run: pnpm run type-check
 
             - name: Lint
-              if: github.event_name != 'workflow_dispatch' || !inputs.diagnose_only
               run: pnpm run lint
 
             - name: Run tests
-              if: github.event_name != 'workflow_dispatch' || !inputs.diagnose_only
               run: pnpm test
 
             - name: Build runtime package
-              if: github.event_name != 'workflow_dispatch' || !inputs.diagnose_only
               run: pnpm run build
 
             - name: Verify package runtime output
-              if: github.event_name != 'workflow_dispatch' || !inputs.diagnose_only
               run: pnpm run pack:check
 
             - name: Publish package to ClawHub
-              if: github.event_name != 'workflow_dispatch' || !inputs.diagnose_only
               env:
                   CLAWHUB_CONFIG_PATH: ${{ runner.temp }}/clawhub-config.json
                   CLAWHUB_SITE: https://clawhub.ai
@@ -143,7 +128,6 @@ jobs:
                     --json
 
             - name: Verify ClawHub publication
-              if: github.event_name != 'workflow_dispatch' || !inputs.diagnose_only
               env:
                   CLAWHUB_TAG: ${{ steps.release.outputs.clawhub_tag }}
                   PACKAGE_PATH: ${{ steps.release.outputs.package_path }}
@@ -166,11 +150,3 @@ jobs:
 
                   echo "::error::ClawHub did not expose ${PACKAGE_VERSION} with tag ${CLAWHUB_TAG} after publication."
                   exit 1
-
-            - name: Remove incomplete ClawHub 3.6.8 release
-              if: (github.event_name != 'workflow_dispatch' || !inputs.diagnose_only) && steps.release.outputs.package_version == '3.6.9'
-              env:
-                  CLAWHUB_CONFIG_PATH: ${{ runner.temp }}/clawhub-config.json
-                  CLAWHUB_SITE: https://clawhub.ai
-                  CLAWHUB_REGISTRY: https://clawhub.ai
-              run: clawhub package delete @soimy/dingtalk --version 3.6.8 --yes --json
