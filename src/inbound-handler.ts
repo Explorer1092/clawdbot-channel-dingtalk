@@ -1,8 +1,7 @@
 import fs from "node:fs";
 import * as path from "node:path";
-import { formatInboundEnvelope } from "openclaw/plugin-sdk/channel-inbound";
 import { isAbortRequestText, isBtwRequestText } from "openclaw/plugin-sdk/reply-runtime";
-import { parseInlineDirectives } from "./messaging/inline-directives";
+import { parseInlineDirectives } from "openclaw/plugin-sdk/text-runtime";
 import { normalizeAllowFrom, isSenderAllowed, resolveGroupAccess } from "./access-control";
 import { classifyAckReactionEmoji } from "./ack-reaction-classifier";
 import { attachNativeAckReaction } from "./ack-reaction-service";
@@ -1793,10 +1792,7 @@ async function handleDingTalkMessageInner(params: HandleDingTalkMessageParams): 
     const groupMembers = !isDirect ? formatGroupMembers(storePath, groupId) : undefined;
 
     const fromLabel = isDirect ? `${senderName} (${senderId})` : `${groupName} - ${senderName}`;
-    // `rt.channel.reply.formatInboundEnvelope` was removed from the runtime
-    // facade in OpenClaw 2026.8.x; the helper is still exported from the
-    // `channel-inbound` SDK subpath.
-    const body = formatInboundEnvelope({
+    const body = rt.channel.reply.formatInboundEnvelope({
       channel: "DingTalk",
       from: fromLabel,
       timestamp: data.createAt,
